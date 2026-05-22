@@ -2,25 +2,38 @@
 ТТМ — Транстелематика
 Flask + PostgreSQL Backend
 """
-import os, json
+import os
+import json
 from datetime import date, datetime
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 import psycopg2
 from psycopg2.extras import RealDictCursor
+from dotenv import load_dotenv   # <-- добавлено для загрузки .env
+
+# Загружаем переменные окружения из файла .env
+load_dotenv()
 
 app = Flask(__name__, static_folder='../frontend', static_url_path='')
 CORS(app)
 
 # ── DB ────────────────────────────────────────────────────────────────────────
-DB_URL = os.getenv('DATABASE_URL', 'postgresql://ttm:ttm2024@localhost:5432/ttm')
+# Читаем параметры подключения из переменных окружения (пароль по умолчанию ttm2024,
+# но теперь он берётся из env, а не из кода)
+DB_HOST = os.getenv('DB_HOST', 'localhost')
+DB_PORT = os.getenv('DB_PORT', '5432')
+DB_NAME = os.getenv('DB_NAME', 'ttm')
+DB_USER = os.getenv('DB_USER', 'ttm')
+DB_PASS = os.getenv('DB_PASS', 'ttm2024')   # пароль не меняем, но храним в env
+
+DB_URL = f'postgresql://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}'
 
 def get_db():
     return psycopg2.connect(DB_URL, cursor_factory=RealDictCursor)
 
 def query(sql, params=(), one=False, commit=False):
     conn = get_db()
-    cur  = conn.cursor()
+    cur = conn.cursor()
     cur.execute(sql, params)
     if commit:
         conn.commit()
@@ -29,7 +42,8 @@ def query(sql, params=(), one=False, commit=False):
         result = cur.fetchone()
     else:
         result = cur.fetchall()
-    cur.close(); conn.close()
+    cur.close()
+    conn.close()
     return result
 
 def serial(obj):
@@ -38,8 +52,11 @@ def serial(obj):
         return obj.isoformat()
     raise TypeError
 
-def ok(data):   return app.response_class(json.dumps(data, default=serial), mimetype='application/json')
-def err(msg,c=400): return jsonify({'error': msg}), c
+def ok(data):
+    return app.response_class(json.dumps(data, default=serial), mimetype='application/json')
+
+def err(msg, c=400):
+    return jsonify({'error': msg}), c
 
 # ── AUTH ──────────────────────────────────────────────────────────────────────
 @app.post('/api/auth/login')
@@ -47,7 +64,8 @@ def login():
     d = request.json or {}
     user = query('SELECT * FROM users WHERE login=%s AND password=%s AND is_active=TRUE',
                  (d.get('login',''), d.get('password','')), one=True)
-    if not user: return err('Неверный логин или пароль', 401)
+    if not user:
+        return err('Неверный логин или пароль', 401)
     dept = query('SELECT name FROM departments WHERE id=%s', (user['department_id'],), one=True) if user['department_id'] else None
     return ok({**dict(user), 'department_name': dept['name'] if dept else None})
 
@@ -80,14 +98,24 @@ def create_user():
     """Директор: добавить сотрудника в любой отдел.
        Менеджер: добавить в свой отдел."""
     d = request.json or {}
-    role = d.get('role','worker')
+    role = d.get('role', 'worker')
     if not d.get('login') or not d.get('full_name'):
         return err('login и full_name обязательны')
+
+    # Пароль: если не передан, генерируем временный (вместо хардкода 'ttm2024')
+    password = d.get('password')
+    if not password:
+        import secrets
+        import string
+        alphabet = string.ascii_letters + string.digits
+        password = ''.join(secrets.choice(alphabet) for _ in range(12))
+        # В реальной системе нужно отправить пароль пользователю по email/SMS
+
     query('''INSERT INTO users(login,password,full_name,role,department_id)
              VALUES(%s,%s,%s,%s,%s)''',
-          (d['login'], d.get('password','ttm2024'), d['full_name'],
+          (d['login'], password, d['full_name'],
            role, d.get('department_id')), commit=True)
-    return ok({'ok': True})
+    return ok({'ok': True, 'generated_password': password if not d.get('password') else None})
 
 @app.put('/api/users/<int:uid>')
 def update_user(uid):
@@ -98,7 +126,8 @@ def update_user(uid):
         if f in d:
             fields.append(f'{f}=%s')
             vals.append(d[f])
-    if not fields: return err('Нет данных для обновления')
+    if not fields:
+        return err('Нет данных для обновления')
     vals.append(uid)
     query(f'UPDATE users SET {",".join(fields)} WHERE id=%s', vals, commit=True)
     return ok({'ok': True})
@@ -118,7 +147,8 @@ def reassign_tasks(uid):
     """Перераспределить задачи уволенного сотрудника."""
     d = request.json or {}
     new_id = d.get('new_responsible_id')
-    if not new_id: return err('new_responsible_id обязателен')
+    if not new_id:
+        return err('new_responsible_id обязателен')
     query('UPDATE tasks SET responsible_id=%s WHERE responsible_id=%s AND status!=\'done\'',
           (new_id, uid), commit=True)
     return ok({'ok': True})
@@ -140,15 +170,20 @@ def get_tasks():
     if p.get('unassigned') == '1':
         sql += " AND t.responsible_id IS NULL AND t.status != 'done'"
     if p.get('department_id'):
-        sql += ' AND t.department_id=%s'; params.append(p['department_id'])
+        sql += ' AND t.department_id=%s'
+        params.append(p['department_id'])
     if p.get('responsible_id'):
-        sql += ' AND t.responsible_id=%s'; params.append(p['responsible_id'])
+        sql += ' AND t.responsible_id=%s'
+        params.append(p['responsible_id'])
     if p.get('status'):
-        sql += ' AND t.status=%s'; params.append(p['status'])
+        sql += ' AND t.status=%s'
+        params.append(p['status'])
     if p.get('period'):
-        sql += ' AND t.period=%s'; params.append(p['period'])
+        sql += ' AND t.period=%s'
+        params.append(p['period'])
     if p.get('priority'):
-        sql += ' AND t.priority=%s'; params.append(p['priority'])
+        sql += ' AND t.priority=%s'
+        params.append(p['priority'])
     if p.get('search'):
         sql += ' AND (t.title ILIKE %s OR t.description ILIKE %s)'
         params += [f"%{p['search']}%", f"%{p['search']}%"]
@@ -162,7 +197,8 @@ def get_task(tid):
         FROM tasks t LEFT JOIN users u ON t.responsible_id=u.id
         LEFT JOIN departments d ON t.department_id=d.id WHERE t.id=%s
     ''', (tid,), one=True)
-    if not t: return err('Не найдено', 404)
+    if not t:
+        return err('Не найдено', 404)
     comments = query('''
         SELECT c.*, u.full_name as author_name FROM comments c
         LEFT JOIN users u ON c.author_id=u.id WHERE c.task_id=%s ORDER BY c.created_at
@@ -174,12 +210,13 @@ def get_task(tid):
 @app.post('/api/tasks')
 def create_task():
     d = request.json or {}
-    if not d.get('title'): return err('title обязателен')
+    if not d.get('title'):
+        return err('title обязателен')
     query('''INSERT INTO tasks(title,description,responsible_id,created_by,department_id,period,deadline,priority,status)
              VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)''',
           (d['title'], d.get('description'), d.get('responsible_id'), d.get('created_by'),
-           d.get('department_id'), d.get('period','week'), d.get('deadline'),
-           d.get('priority','medium'), d.get('status','new')), commit=True)
+           d.get('department_id'), d.get('period', 'week'), d.get('deadline'),
+           d.get('priority', 'medium'), d.get('status', 'new')), commit=True)
     return ok({'ok': True}), 201
 
 @app.put('/api/tasks/<int:tid>')
@@ -188,8 +225,10 @@ def update_task(tid):
     fields, vals = [], []
     for f in ('title','description','responsible_id','department_id','period','deadline','priority','status'):
         if f in d:
-            fields.append(f'{f}=%s'); vals.append(d[f])
-    if not fields: return err('Нет данных')
+            fields.append(f'{f}=%s')
+            vals.append(d[f])
+    if not fields:
+        return err('Нет данных')
     vals.append(tid)
     query(f'UPDATE tasks SET {",".join(fields)} WHERE id=%s', vals, commit=True)
     return ok({'ok': True})
@@ -202,7 +241,8 @@ def delete_task(tid):
 @app.post('/api/tasks/<int:tid>/comments')
 def add_comment(tid):
     d = request.json or {}
-    if not d.get('text'): return err('text обязателен')
+    if not d.get('text'):
+        return err('text обязателен')
     query('INSERT INTO comments(task_id,author_id,text) VALUES(%s,%s,%s)',
           (tid, d.get('author_id'), d['text']), commit=True)
     return ok({'ok': True}), 201
@@ -210,19 +250,19 @@ def add_comment(tid):
 # ── ANALYTICS ─────────────────────────────────────────────────────────────────
 @app.get('/api/analytics')
 def analytics():
-    total     = query('SELECT COUNT(*) as n FROM tasks', one=True)['n']
+    total = query('SELECT COUNT(*) as n FROM tasks', one=True)['n']
     by_status = {r['status']: r['n'] for r in query('SELECT status, COUNT(*) as n FROM tasks GROUP BY status')}
-    by_dept   = {r['department_name']: r['n'] for r in query(
+    by_dept = {r['department_name']: r['n'] for r in query(
         'SELECT d.name as department_name, COUNT(*) as n FROM tasks t LEFT JOIN departments d ON t.department_id=d.id GROUP BY d.name')}
     by_period = {r['period']: r['n'] for r in query('SELECT period, COUNT(*) as n FROM tasks GROUP BY period')}
-    overdue   = query("SELECT COUNT(*) as n FROM tasks WHERE status='overdue'", one=True)['n']
-    at_risk   = query(
+    overdue = query("SELECT COUNT(*) as n FROM tasks WHERE status='overdue'", one=True)['n']
+    at_risk = query(
         "SELECT COUNT(*) as n FROM tasks WHERE deadline BETWEEN NOW() AND NOW()+INTERVAL'7 days' AND status NOT IN ('done','overdue')",
         one=True)['n']
     load = {r['full_name']: r['n'] for r in query(
         "SELECT u.full_name, COUNT(*) as n FROM tasks t LEFT JOIN users u ON t.responsible_id=u.id WHERE t.status!='done' GROUP BY u.full_name")}
-    return ok({'total':total,'by_status':by_status,'by_dept':by_dept,'by_period':by_period,
-               'overdue':overdue,'at_risk':at_risk,'employee_load':load})
+    return ok({'total': total, 'by_status': by_status, 'by_dept': by_dept, 'by_period': by_period,
+               'overdue': overdue, 'at_risk': at_risk, 'employee_load': load})
 
 # ── AI AGENT (GigaChat / Сбер) ─────────────────────────────────────────────────
 import urllib.request
@@ -232,22 +272,21 @@ import uuid
 import io
 import time
 
-# Ключ авторизации GigaChat (Authorization Key из личного кабинета)
-GIGACHAT_AUTH_KEY = os.getenv(
-    'GIGACHAT_AUTH_KEY',
-    'MDE5ZTRlZDktYWVhZi03ODkwLWJjOTMtMTc4ZjA1NTYxZmI2OmEyMTAyNzdlLTcxNmQtNGI0Yi1hZThiLTUzOTlmY2E2YzFmYg=='
-)
-GIGACHAT_SCOPE = os.getenv('GIGACHAT_SCOPE', 'GIGACHAT_API_PERS')  # PERS — физлица
+# Ключ авторизации GigaChat — теперь ТОЛЬКО из переменной окружения
+GIGACHAT_AUTH_KEY = os.getenv('GIGACHAT_AUTH_KEY')
+if not GIGACHAT_AUTH_KEY:
+    raise RuntimeError('Переменная окружения GIGACHAT_AUTH_KEY не установлена!')
+
+GIGACHAT_SCOPE = os.getenv('GIGACHAT_SCOPE', 'GIGACHAT_API_PERS')
 GIGACHAT_MODEL = 'GigaChat'
 OAUTH_URL = 'https://ngw.devices.sberbank.ru:9443/api/v2/oauth'
-CHAT_URL  = 'https://gigachat.devices.sberbank.ru/api/v1/chat/completions'
+CHAT_URL = 'https://gigachat.devices.sberbank.ru/api/v1/chat/completions'
 
-# GigaChat использует сертификаты Минцифры — отключаем проверку SSL
+# Используем стандартную проверку SSL (безопасно)
 _SSL = ssl.create_default_context()
-_SSL.check_hostname = False
-_SSL.verify_mode = ssl.CERT_NONE
+# При необходимости можно указать свой файл сертификатов:
+# _SSL.load_verify_locations(cafile='/путь/к/сертификатам.pem')
 
-# Кэш access-токена (живёт 30 минут)
 _token_cache = {'token': None, 'expires': 0}
 
 AGENT_PERSONA = (
@@ -276,9 +315,10 @@ def get_gigachat_token():
         },
         method='POST',
     )
+    # Используем безопасный SSL-контекст
     with urllib.request.urlopen(req, timeout=30, context=_SSL) as resp:
         d = json.loads(resp.read().decode('utf-8'))
-    _token_cache['token']   = d['access_token']
+    _token_cache['token'] = d['access_token']
     # expires_at в миллисекундах; обновляем за 60 сек до истечения
     _token_cache['expires'] = d.get('expires_at', 0) / 1000 - 60
     if _token_cache['expires'] < now:
@@ -297,7 +337,7 @@ def call_gigachat(user_text, context=''):
         'model': GIGACHAT_MODEL,
         'messages': [
             {'role': 'system', 'content': system},
-            {'role': 'user',   'content': user_text},
+            {'role': 'user', 'content': user_text},
         ],
         'temperature': 0.6,
     }
@@ -317,7 +357,6 @@ def call_gigachat(user_text, context=''):
         return d['choices'][0]['message']['content']
     except urllib.error.HTTPError as e:
         body = e.read().decode('utf-8', errors='ignore')
-        # токен мог протухнуть — сбрасываем кэш на следующий раз
         _token_cache['token'] = None
         return f'[Ошибка GigaChat API: {e.code}] {body[:200]}'
     except Exception as e:
@@ -344,7 +383,7 @@ def build_tasks_context():
     for t in tasks:
         dl = t['deadline'].isoformat() if t['deadline'] else 'нет'
         lines.append(f"- [{t['status']}/{t['priority']}/{t['period']}] {t['title']} "
-                      f"(отдел: {t['dept']}, ответств.: {t['resp'] or 'НЕ НАЗНАЧЕН'}, дедлайн: {dl})")
+                     f"(отдел: {t['dept']}, ответств.: {t['resp'] or 'НЕ НАЗНАЧЕН'}, дедлайн: {dl})")
     return '\n'.join(lines)
 
 @app.post('/api/ai/chat')
@@ -370,9 +409,9 @@ def ai_report():
     return ok({'report': report, 'generated_at': datetime.now().isoformat()})
 
 # ── ЭКСПОРТ ОТЧЁТА ─────────────────────────────────────────────────────────────
-RU_STATUS = {'new':'Новая','in_progress':'В работе','review':'На согласовании',
-             'done':'Выполнена','overdue':'Просрочена'}
-RU_PERIOD = {'year':'Год','quarter':'Квартал','month':'Месяц','week':'Неделя'}
+RU_STATUS = {'new': 'Новая', 'in_progress': 'В работе', 'review': 'На согласовании',
+             'done': 'Выполнена', 'overdue': 'Просрочена'}
+RU_PERIOD = {'year': 'Год', 'quarter': 'Квартал', 'month': 'Месяц', 'week': 'Неделя'}
 
 @app.get('/api/ai/report/excel')
 def report_excel():
@@ -386,14 +425,14 @@ def report_excel():
     text = call_gigachat(REPORT_PROMPT, build_tasks_context())
 
     wb = Workbook()
-    blue   = PatternFill('solid', fgColor='003C97')
-    light  = PatternFill('solid', fgColor='9CDDE6')
-    hdr_f  = Font(bold=True, color='FFFFFF', size=11)
-    title_f= Font(bold=True, color='020F52', size=14)
-    thin   = Side(style='thin', color='D0DCEA')
+    blue = PatternFill('solid', fgColor='003C97')
+    light = PatternFill('solid', fgColor='9CDDE6')
+    hdr_f = Font(bold=True, color='FFFFFF', size=11)
+    title_f = Font(bold=True, color='020F52', size=14)
+    thin = Side(style='thin', color='D0DCEA')
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
 
-    # ── Лист 1: Сводка ──
+    # Лист 1: Сводка
     ws = wb.active
     ws.title = 'Сводка'
     ws.column_dimensions['A'].width = 34
@@ -409,59 +448,81 @@ def report_excel():
         ('В зоне риска', a['at_risk']),
         ('Выполнено', a['by_status'].get('done', 0)),
     ]
-    ws['A4'] = 'Показатель'; ws['B4'] = 'Значение'
-    for c in ('A4','B4'):
-        ws[c].fill = blue; ws[c].font = hdr_f; ws[c].border = border
-    for i,(k,v) in enumerate(kpis, start=5):
-        ws[f'A{i}'] = k; ws[f'B{i}'] = v
-        ws[f'A{i}'].border = border; ws[f'B{i}'].border = border
+    ws['A4'] = 'Показатель'
+    ws['B4'] = 'Значение'
+    for c in ('A4', 'B4'):
+        ws[c].fill = blue
+        ws[c].font = hdr_f
+        ws[c].border = border
+    for i, (k, v) in enumerate(kpis, start=5):
+        ws[f'A{i}'] = k
+        ws[f'B{i}'] = v
+        ws[f'A{i}'].border = border
+        ws[f'B{i}'].border = border
 
-    # ── Лист 2: Статусы (+ круговая диаграмма) ──
+    # Лист 2: Статусы
     ws2 = wb.create_sheet('Статусы')
     ws2.column_dimensions['A'].width = 22
-    ws2['A1'] = 'Статус'; ws2['B1'] = 'Кол-во'
-    for c in ('A1','B1'):
-        ws2[c].fill = blue; ws2[c].font = hdr_f
+    ws2['A1'] = 'Статус'
+    ws2['B1'] = 'Кол-во'
+    for c in ('A1', 'B1'):
+        ws2[c].fill = blue
+        ws2[c].font = hdr_f
     r = 2
-    for k,v in a['by_status'].items():
-        ws2[f'A{r}'] = RU_STATUS.get(k,k); ws2[f'B{r}'] = v; r += 1
+    for k, v in a['by_status'].items():
+        ws2[f'A{r}'] = RU_STATUS.get(k, k)
+        ws2[f'B{r}'] = v
+        r += 1
     if r > 2:
-        pie = PieChart(); pie.title = 'Распределение по статусам'
+        pie = PieChart()
+        pie.title = 'Распределение по статусам'
         pie.add_data(Reference(ws2, min_col=2, min_row=1, max_row=r-1), titles_from_data=True)
         pie.set_categories(Reference(ws2, min_col=1, min_row=2, max_row=r-1))
         ws2.add_chart(pie, 'D2')
 
-    # ── Лист 3: Отделы (+ столбчатая диаграмма) ──
+    # Лист 3: Отделы
     ws3 = wb.create_sheet('Отделы')
     ws3.column_dimensions['A'].width = 24
-    ws3['A1'] = 'Отдел'; ws3['B1'] = 'Задач'
-    for c in ('A1','B1'):
-        ws3[c].fill = blue; ws3[c].font = hdr_f
+    ws3['A1'] = 'Отдел'
+    ws3['B1'] = 'Задач'
+    for c in ('A1', 'B1'):
+        ws3[c].fill = blue
+        ws3[c].font = hdr_f
     r = 2
-    for k,v in a['by_dept'].items():
-        ws3[f'A{r}'] = k or 'Без отдела'; ws3[f'B{r}'] = v; r += 1
+    for k, v in a['by_dept'].items():
+        ws3[f'A{r}'] = k or 'Без отдела'
+        ws3[f'B{r}'] = v
+        r += 1
     if r > 2:
-        bar = BarChart(); bar.title = 'Задачи по отделам'; bar.type = 'col'
+        bar = BarChart()
+        bar.title = 'Задачи по отделам'
+        bar.type = 'col'
         bar.add_data(Reference(ws3, min_col=2, min_row=1, max_row=r-1), titles_from_data=True)
         bar.set_categories(Reference(ws3, min_col=1, min_row=2, max_row=r-1))
         ws3.add_chart(bar, 'D2')
 
-    # ── Лист 4: Загрузка сотрудников ──
+    # Лист 4: Загрузка сотрудников
     ws4 = wb.create_sheet('Загрузка')
     ws4.column_dimensions['A'].width = 26
-    ws4['A1'] = 'Сотрудник'; ws4['B1'] = 'Активных задач'
-    for c in ('A1','B1'):
-        ws4[c].fill = blue; ws4[c].font = hdr_f
+    ws4['A1'] = 'Сотрудник'
+    ws4['B1'] = 'Активных задач'
+    for c in ('A1', 'B1'):
+        ws4[c].fill = blue
+        ws4[c].font = hdr_f
     r = 2
-    for k,v in a['employee_load'].items():
-        ws4[f'A{r}'] = k or '—'; ws4[f'B{r}'] = v; r += 1
+    for k, v in a['employee_load'].items():
+        ws4[f'A{r}'] = k or '—'
+        ws4[f'B{r}'] = v
+        r += 1
     if r > 2:
-        bar2 = BarChart(); bar2.title = 'Загрузка сотрудников'; bar2.type = 'bar'
+        bar2 = BarChart()
+        bar2.title = 'Загрузка сотрудников'
+        bar2.type = 'bar'
         bar2.add_data(Reference(ws4, min_col=2, min_row=1, max_row=r-1), titles_from_data=True)
         bar2.set_categories(Reference(ws4, min_col=1, min_row=2, max_row=r-1))
         ws4.add_chart(bar2, 'D2')
 
-    # ── Лист 5: AI-анализ ──
+    # Лист 5: AI-анализ
     ws5 = wb.create_sheet('AI-анализ')
     ws5.column_dimensions['A'].width = 100
     ws5['A1'] = 'Аналитический отчёт AI-агента'
@@ -519,8 +580,8 @@ def report_pdf():
                         textColor=colors.HexColor('#003C97'), fontSize=13)
     body = ParagraphStyle('body', parent=styles['Normal'], fontName=font_name,
                           fontSize=10, leading=15)
-    small= ParagraphStyle('small', parent=styles['Normal'], fontName=font_name,
-                          fontSize=8, textColor=colors.HexColor('#7A96B4'))
+    small = ParagraphStyle('small', parent=styles['Normal'], fontName=font_name,
+                           fontSize=8, textColor=colors.HexColor('#7A96B4'))
 
     elems = []
     elems.append(Paragraph('ТТМ — Отчёт по задачам', h1))
@@ -558,8 +619,8 @@ def report_pdf():
         pie = Pie()
         pie.x, pie.y = 130, 15
         pie.width = pie.height = 150
-        pie.data   = list(a['by_status'].values())
-        pie.labels = [RU_STATUS.get(k,k) for k in a['by_status']]
+        pie.data = list(a['by_status'].values())
+        pie.labels = [RU_STATUS.get(k, k) for k in a['by_status']]
         for i in range(len(pie.data)):
             pie.slices[i].fillColor = palette[i % len(palette)]
         d.add(pie)
@@ -588,8 +649,8 @@ def report_pdf():
     elems.append(Paragraph('Аналитический отчёт AI-агента', h2))
     for line in text.split('\n'):
         if line.strip():
-            safe = line.replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')
-            safe = safe.replace('**','')
+            safe = line.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+            safe = safe.replace('**', '')
             elems.append(Paragraph(safe, body))
         else:
             elems.append(Spacer(1, 0.2*cm))
